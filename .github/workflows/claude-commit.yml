@@ -1,4 +1,4 @@
-name: Claude Commit (Slash Command, both comment types)
+name: Claude Commit (Slash Command, robust v3)
 
 on:
   issue_comment:
@@ -40,7 +40,9 @@ jobs:
           else
             PR_NUM="${{ github.event.pull_request.number }}"
           fi
-          curl -s -H "Authorization: Bearer $GITHUB_TOKEN"                -H "Accept: application/vnd.github+json"                "${{ github.api_url }}/repos/${{ github.repository }}/pulls/$PR_NUM" > pr.json
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "${{ github.api_url }}/repos/${{ github.repository }}/pulls/$PR_NUM" > pr.json
           echo "pr_number=$PR_NUM" >> $GITHUB_OUTPUT
           echo "head_ref=$(jq -r '.head.ref' pr.json)" >> $GITHUB_OUTPUT
           echo "head_repo=$(jq -r '.head.repo.full_name' pr.json)" >> $GITHUB_OUTPUT
@@ -86,6 +88,9 @@ jobs:
         id: claude
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_ASK: ${{ steps.msg.outputs.ask }}
+          PR_TREE: ${{ steps.ctx.outputs.tree }}
+          PR_BLOBS: ${{ steps.ctx.outputs.blobs }}
         run: |
           SYSTEM=$(cat <<'EOS'
 You are an expert software engineer. Output ONLY a valid unified diff (git patch) against the current HEAD of this repo. No prose, no fences. Keep changes minimal, correct, and buildable. If adding files, include proper diff headers (new file mode, index, --- /dev/null, +++ path).
@@ -96,26 +101,33 @@ Constraints:
 EOS
 )
 
-          USER=$(cat <<'EOU'
+          USER=$(cat <<EOS
 User request:
-${{ steps.msg.outputs.ask }}
+$PR_ASK
 
 Repo tree (truncated):
-${{ steps.ctx.outputs.tree }}
+$PR_TREE
 
 Key files (truncated):
-${{ steps.ctx.outputs.blobs }}
-EOU
+$PR_BLOBS
+EOS
 )
 
-          JSON=$(jq -n             --arg sys "$SYSTEM"             --arg user "$USER"             '{
+          JSON=$(jq -n \
+            --arg sys "$SYSTEM" \
+            --arg user "$USER" \
+            '{
               model: "claude-3-5-sonnet-20240620",
               max_tokens: 1500,
               system: $sys,
               messages: [{ "role": "user", "content": $user }]
             }')
 
-          curl -s https://api.anthropic.com/v1/messages                -H "x-api-key: $ANTHROPIC_API_KEY"                -H "anthropic-version: 2023-06-01"                -H "content-type: application/json"                -d "$JSON" > out.json
+          curl -s https://api.anthropic.com/v1/messages \
+               -H "x-api-key: $ANTHROPIC_API_KEY" \
+               -H "anthropic-version: 2023-06-01" \
+               -H "content-type: application/json" \
+               -d "$JSON" > out.json
 
           jq -r '.content[0].text' out.json > patch.diff
 
@@ -147,7 +159,12 @@ EOU
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          PR_NUM="${{ steps.pr.outputs.pr_number }}"
           BODY="🚀 Applied Claude-generated patch for:\n\n> ${{ steps.msg.outputs.ask }}\n\nIf build fails, reply with \`/claude commit: fix build errors\`."
-          curl -s -X POST             -H "Authorization: Bearer $GITHUB_TOKEN"             -H "Accept: application/vnd.github+json"             -d @-             "${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr_number }}/comments" <<EOF >/dev/null
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d @- \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/$PR_NUM/comments" <<EOF >/dev/null
 {"body": "$BODY"}
 EOF
