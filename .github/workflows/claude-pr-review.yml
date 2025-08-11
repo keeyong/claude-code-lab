@@ -1,0 +1,70 @@
+name: Claude PR Review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Gather PR context
+        id: ctx
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
+          echo "PR_TITLE=$(echo "${{ github.event.pull_request.title }}" | tr -d '\n')" >> $GITHUB_OUTPUT
+          echo "PR_BODY<<EOF" >> $GITHUB_OUTPUT
+          echo "${{ github.event.pull_request.body }}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "${{ github.api_url }}/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files?per_page=100" \
+               > files.json
+          echo "FILES=$(jq -r '.[] | \"\(.filename): \(.changes) changes\"' files.json | head -n 50 | paste -sd '\n' -)" >> $GITHUB_OUTPUT
+
+      - name: Ask Claude
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          PROMPT=$(cat <<'EOP'
+You are a senior code reviewer. Given the PR title, description, and changed files, write a concise review with:
+- risks/bugs
+- security concerns
+- tests to add
+- specific suggestions
+EOP
+)
+          JSON=$(jq -n --arg title "${{ steps.ctx.outputs.PR_TITLE }}" \
+                        --arg body "${{ steps.ctx.outputs.PR_BODY }}" \
+                        --arg files "${{ steps.ctx.outputs.FILES }}" \
+                        '{model:"claude-3-5-sonnet-20240620", max_tokens:600, messages:[{role:"user", content: "PR Title:\n\($title)\n\nPR Body:\n\($body)\n\nChanged files:\n\($files)"}]}')
+          curl -s https://api.anthropic.com/v1/messages \
+               -H "x-api-key: $ANTHROPIC_API_KEY" \
+               -H "anthropic-version: 2023-06-01" \
+               -H "content-type: application/json" \
+               -d "$JSON" > claude.json
+          TEXT=$(jq -r '.content[0].text' claude.json)
+          echo "TEXT<<EOF" >> $GITHUB_OUTPUT
+          echo "$TEXT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post review comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="🤖 Claude review:\n\n${{ steps.claude.outputs.TEXT }}"
+          jq -n --arg body "$BODY" '{body:$body}' > body.json
+          curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               -d @body.json \
+               "${{ github.api_url }}/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments"
