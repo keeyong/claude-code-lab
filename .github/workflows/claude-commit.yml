@@ -1,0 +1,155 @@
+name: Claude Commit (Slash Command)
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  commit_on_command:
+    if: ${{ github.event.issue.pull_request != null && startsWith(github.event.comment.body, '/claude commit') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq patch
+
+      - name: Fetch PR info
+        id: pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUM="${{ github.event.issue.number }}"
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               "${{ github.api_url }}/repos/${{ github.repository }}/pulls/$PR_NUM" > pr.json
+          echo "head_ref=$(jq -r '.head.ref' pr.json)" >> $GITHUB_OUTPUT
+          echo "head_repo=$(jq -r '.head.repo.full_name' pr.json)" >> $GITHUB_OUTPUT
+          echo "base_ref=$(jq -r '.base.ref' pr.json)" >> $GITHUB_OUTPUT
+
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pr.outputs.head_repo }}
+          ref: ${{ steps.pr.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Extract user request
+        id: msg
+        run: |
+          RAW="${{ github.event.comment.body }}"
+          # supports: "/claude commit: <ask>" or "/claude commit <ask>"
+          ASK=$(echo "$RAW" | sed -E 's@^/claude[[:space:]]+commit:?[[:space:]]*@@')
+          echo "ask<<EOF" >> $GITHUB_OUTPUT
+          echo "$ASK" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Prepare repo snapshot (bounded context)
+        id: ctx
+        run: |
+          # 작은 저장소 기준: 파일 목록 + 주요 엔트리 포인트 몇 개만 전달 (길이 제한)
+          TREE=$(git ls-files | head -n 400)
+          # 대표 파일들 내용을 제한적으로 첨부 (필요시 폴더 맞게 조정)
+          BLOB=""
+          for f in package.json next.config.js src/App.tsx src/App.jsx pages/_app.tsx pages/index.tsx app/page.tsx; do
+            if [ -f "$f" ]; then
+              echo "### FILE: $f"
+              echo '```'
+              sed -n '1,300p' "$f"
+              echo '```'
+            fi
+          done > blobs.txt
+          echo "tree<<EOF" >> $GITHUB_OUTPUT
+          echo "$TREE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "blobs<<EOF" >> $GITHUB_OUTPUT
+          cat blobs.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Ask Claude for a unified diff patch
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          read -r -d '' SYSTEM << 'EOS'
+You are an expert software engineer. Output ONLY a valid unified diff (git patch) against the current HEAD of this repo. No prose, no fences. Keep changes minimal, correct, and buildable. If adding files, include proper diff headers (new file mode, index, --- /dev/null, +++ path).
+Constraints:
+- Prefer editing existing entry points (e.g., pages/_app.tsx, pages/index.tsx, app/page.tsx, src/App.*).
+- If dark mode is requested, implement a simple toggle (state + CSS classes) with minimal files.
+- Do not modify lockfiles.
+- Keep patch under ~500 lines.
+EOS
+
+          read -r -d '' USER << 'EOU'
+User request:
+${{ steps.msg.outputs.ask }}
+
+Repo tree (truncated):
+${{ steps.ctx.outputs.tree }}
+
+Key files (truncated):
+${{ steps.ctx.outputs.blobs }}
+EOU
+
+          JSON=$(jq -n \
+            --arg sys "$SYSTEM" \
+            --arg user "$USER" \
+            '{
+              model: "claude-3-5-sonnet-20240620",
+              max_tokens: 1500,
+              system: $sys,
+              messages: [{role:"user", content:$user}]
+            }')
+
+          curl -s https://api.anthropic.com/v1/messages \
+               -H "x-api-key: $ANTHROPIC_API_KEY" \
+               -H "anthropic-version: 2023-06-01" \
+               -H "content-type: application/json" \
+               -d "$JSON" > out.json
+
+          # Extract raw text
+          jq -r '.content[0].text' out.json > patch.diff
+
+          # Basic sanity check: must contain diff headers
+          if ! grep -qE '^\+\+\+ ' patch.diff; then
+            echo "Claude did not return a valid unified diff."
+            echo "Response was:"
+            cat patch.diff
+            exit 1
+          fi
+
+      - name: Apply patch
+        run: |
+          git config user.name "claude-bot"
+          git config user.email "claude-bot@example.com"
+          git apply --whitespace=fix --reject patch.diff || {
+            echo "::warning::Patch had rejects, attempting manual patch"
+            patch -p1 < patch.diff || exit 1
+          }
+          git status
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "No changes after patch."
+            exit 1
+          fi
+          git add -A
+          git commit -m "feat(claude): apply requested change via /claude commit"
+          git push origin HEAD
+
+      - name: Reply to trigger comment
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BODY="🚀 Applied Claude-generated patch for:\n\n> ${{ steps.msg.outputs.ask }}\n\nIf build fails, reply with \`/claude commit: fix build errors\`."
+          jq -n --arg body "$BODY" '{body:$body}' > body.json
+          curl -s -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d @body.json \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/replies" > /dev/null
